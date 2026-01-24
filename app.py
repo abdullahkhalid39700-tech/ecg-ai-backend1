@@ -6,38 +6,48 @@ import pandas as pd
 from typing import Annotated
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.pool import NullPool
 from bcrypt import hashpw, gensalt, checkpw
 from inference import predict_ecg
 
-app = FastAPI(title="ECG Arrhythmia Detection API with Auth")
+app = FastAPI(title="HeartAI Neural Core API")
 
 # --- DATABASE SETUP ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
-SECRET_KEY = os.environ.get("SECRET_KEY", "your_fallback_secret")
+SECRET_KEY = os.environ.get("SECRET_KEY", "your_fallback_secret") #
 
-# Essential for Render + Supabase Pooler (Port 6543)
 engine = create_engine(
     DATABASE_URL, 
-    poolclass=NullPool, 
+    poolclass=NullPool, # Essential for Supabase Port 6543
     connect_args={"sslmode": "require"}
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# --- MODELS ---
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
-    password = Column(String, nullable=False)
+    password = Column(String, nullable=False) #
+    history = relationship("History", back_populates="owner")
 
-# Create tables in Supabase
-Base.metadata.create_all(bind=engine)
+class History(Base): # New table for Diagnostic History
+    __tablename__ = "history"
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String)
+    result = Column(String)
+    probability = Column(Float)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    owner = relationship("User", back_populates="history")
 
-# Dependency to get DB session
+Base.metadata.create_all(bind=engine) #
+
+# --- DEPENDENCIES ---
 def get_db():
     db = SessionLocal()
     try:
@@ -45,72 +55,88 @@ def get_db():
     finally:
         db.close()
 
+# Helper to verify JWT and return email
+def get_current_user(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Token")
+    try:
+        payload = jwt.decode(authorization, SECRET_KEY, algorithms=["HS256"])
+        return payload.get("sub")
+    except:
+        raise HTTPException(status_code=401, detail="Invalid Session")
+
 # --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # Allows your Render frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- AUTH LOGIC ---
+# --- AUTH ROUTES ---
 @app.post("/signup")
 def signup(data: dict, db: Session = Depends(get_db)):
-    # Hash password
-    hashed = hashpw(data['password'].encode('utf-8'), gensalt()).decode('utf-8')
+    hashed = hashpw(data['password'].encode('utf-8'), gensalt()).decode('utf-8') #
     new_user = User(email=data['email'], password=hashed)
     try:
         db.add(new_user)
         db.commit()
-        return {"message": "User created"}
+        return {"message": "Success"}
     except:
-        raise HTTPException(status_code=400, detail="User already exists")
+        raise HTTPException(status_code=400, detail="Practitioner already registered")
 
 @app.post("/login")
 def login(data: dict, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == data['email']).first()
+    user = db.query(User).filter(User.email == data['email']).first() #
     if not user or not checkpw(data['password'].encode('utf-8'), user.password.encode('utf-8')):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid Access Code")
     
     token = jwt.encode({
         "sub": user.email,
         "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)
-    }, SECRET_KEY, algorithm="HS256")
+    }, SECRET_KEY, algorithm="HS256") #
     
     return {"token": token}
 
-# --- PROTECTED PREDICT ROUTE ---
+# --- DIAGNOSTIC ROUTES ---
 @app.post("/predict")
 async def predict(
     file: UploadFile = File(...), 
-    authorization: Annotated[str | None, Header()] = None
+    db: Session = Depends(get_db),
+    email: str = Depends(get_current_user)
 ):
-    # 1. Check for token in Header
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization Header")
-    
-    try:
-        # Verify Token
-        jwt.decode(authorization, SECRET_KEY, algorithms=["HS256"])
-    except:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    # 2. Original Prediction Logic
     try:
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
-        if df.empty:
-            return {"error": "The uploaded CSV file is empty."}
-
         ecg = df.iloc[:, 1].values.astype(float)
-        result = predict_ecg(ecg)
-        result["waveform"] = ecg.tolist()[:1000]
         
-        return result
+        # Run AI Analysis
+        prediction = predict_ecg(ecg)
+        
+        # Get User ID
+        user = db.query(User).filter(User.email == email).first()
+        
+        # Save to History table
+        diag_entry = History(
+            filename=file.filename,
+            result=prediction["prediction"],
+            probability=float(prediction["average_probability"]),
+            user_id=user.id
+        )
+        db.add(diag_entry)
+        db.commit()
+
+        prediction["waveform"] = ecg.tolist()[:1000]
+        return prediction
     except Exception as e:
-        return {"error": f"Processing failed: {str(e)}"}
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/history") # New route for frontend to see past tests
+def get_history(db: Session = Depends(get_db), email: str = Depends(get_current_user)):
+    user = db.query(User).filter(User.email == email).first()
+    return db.query(History).filter(History.user_id == user.id).order_by(History.created_at.desc()).all()
 
 @app.get("/")
 def root():
-    return {"status": "ECG model running with security"}
+    return {"status": "Neural Core Operational", "mode": "Production"}
