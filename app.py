@@ -13,11 +13,12 @@ from sqlalchemy.pool import NullPool
 from bcrypt import hashpw, gensalt, checkpw
 from inference import predict_ecg
 
-app = FastAPI(title="HeartAI Neural Core API")
+# Updated Branding
+app = FastAPI(title="Pulse Prognosis Neural Core API")
 
 # ===================== DATABASE SETUP =====================
 DATABASE_URL = os.environ.get("DATABASE_URL")
-SECRET_KEY = os.environ.get("SECRET_KEY", "your_fallback_secret")
+SECRET_KEY = os.environ.get("SECRET_KEY", "pulse_prognosis_secure_key_2024")
 
 engine = create_engine(
     DATABASE_URL,
@@ -80,17 +81,17 @@ def get_db():
 
 def get_current_user(authorization: str = Header(None)):
     if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Token")
+        raise HTTPException(status_code=401, detail="Session expired. Please Login.")
     try:
         payload = jwt.decode(authorization, SECRET_KEY, algorithms=["HS256"])
         return payload.get("sub")
     except:
-        raise HTTPException(status_code=401, detail="Invalid Session")
+        raise HTTPException(status_code=401, detail="Invalid Session. Please Login.")
 
 # ===================== CORS =====================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update to your frontend URL in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -99,20 +100,22 @@ app.add_middleware(
 # ===================== AUTH ROUTES =====================
 @app.post("/signup")
 def signup(data: dict, db: Session = Depends(get_db)):
+    # Basic check for existing user
+    existing = db.query(User).filter(User.email == data['email']).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
+        
     hashed = hashpw(data['password'].encode('utf-8'), gensalt()).decode('utf-8')
     new_user = User(email=data['email'], password=hashed)
-    try:
-        db.add(new_user)
-        db.commit()
-        return {"message": "Success"}
-    except:
-        raise HTTPException(status_code=400, detail="Practitioner already registered")
+    db.add(new_user)
+    db.commit()
+    return {"message": "Signup successful"}
 
 @app.post("/login")
 def login(data: dict, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data['email']).first()
     if not user or not checkpw(data['password'].encode('utf-8'), user.password.encode('utf-8')):
-        raise HTTPException(status_code=401, detail="Invalid Access Code")
+        raise HTTPException(status_code=401, detail="Invalid Email or Password")
     
     token = jwt.encode({
         "sub": user.email,
@@ -133,24 +136,19 @@ async def upload_ecg(
 ):
     user = db.query(User).filter(User.email == email).first()
 
-    # Find or create patient
-    patient = db.query(Patient).filter(
-        Patient.name == patient_name,
-        Patient.user_id == user.id
-    ).first()
+    patient = db.query(Patient).filter(Patient.name == patient_name, Patient.user_id == user.id).first()
     if not patient:
         patient = Patient(name=patient_name, age=age, gender=gender, user_id=user.id)
         db.add(patient)
         db.commit()
 
-    # Save file locally
     os.makedirs("storage", exist_ok=True)
     timestamp = datetime.datetime.utcnow().timestamp()
-    file_location = f"storage/{timestamp}_{file.filename}"
+    file_location = f"storage/{int(timestamp)}_{file.filename}"
+    
     with open(file_location, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Save DB record
     ecg_entry = ECGFile(
         filename=file.filename,
         file_path=file_location,
@@ -160,7 +158,7 @@ async def upload_ecg(
     db.add(ecg_entry)
     db.commit()
 
-    return {"message": "ECG stored successfully", "file_path": file_location}
+    return {"message": "Record Stored"}
 
 # ===================== LIST ECG FILES =====================
 @app.get("/ecg-files")
@@ -181,34 +179,35 @@ def list_files(db: Session = Depends(get_db), email: str = Depends(get_current_u
 @app.post("/predict-from-file/{file_id}")
 def predict_from_file(file_id: int, db: Session = Depends(get_db), email: str = Depends(get_current_user)):
     user = db.query(User).filter(User.email == email).first()
-    ecg_file = db.query(ECGFile).filter(
-        ECGFile.id == file_id,
-        ECGFile.user_id == user.id
-    ).first()
-    if not ecg_file:
-        raise HTTPException(status_code=404, detail="File not found")
+    ecg_file = db.query(ECGFile).filter(ECGFile.id == file_id, ECGFile.user_id == user.id).first()
+    
+    if not ecg_file or not os.path.exists(ecg_file.file_path):
+        raise HTTPException(status_code=404, detail="Physical file missing from server storage")
 
-    # Read ECG CSV
-    df = pd.read_csv(ecg_file.file_path)
-    ecg = df.iloc[:, 1].values.astype(float)
-    prediction = predict_ecg(ecg)
+    try:
+        df = pd.read_csv(ecg_file.file_path)
+        # FIX: Check if CSV has enough columns. Use col 1 if exists, else col 0.
+        column_index = 1 if df.shape[1] > 1 else 0
+        ecg = df.iloc[:, column_index].values.astype(float)
+        
+        prediction = predict_ecg(ecg)
 
-    # Save to history
-    diag_entry = History(
-        filename=ecg_file.filename,
-        result=prediction["prediction"],
-        probability=float(prediction.get("average_probability", prediction.get("probability", 0))),
-        user_id=user.id
-    )
-    db.add(diag_entry)
-    db.commit()
+        diag_entry = History(
+            filename=ecg_file.filename,
+            result=prediction["prediction"],
+            probability=float(prediction.get("average_probability", 0)),
+            user_id=user.id
+        )
+        db.add(diag_entry)
+        db.commit()
 
-    # Return for frontend
-    return {
-        "prediction": prediction["prediction"],
-        "probability": float(prediction.get("average_probability", prediction.get("probability", 0))),
-        "waveform": ecg.tolist()[:1000]
-    }
+        return {
+            "prediction": prediction["prediction"],
+            "probability": float(prediction.get("average_probability", 0)),
+            "waveform": ecg.tolist()[:1000]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Data processing error: {str(e)}")
 
 # ===================== HISTORY =====================
 @app.get("/history")
@@ -218,4 +217,4 @@ def get_history(db: Session = Depends(get_db), email: str = Depends(get_current_
 
 @app.get("/")
 def root():
-    return {"status": "Neural Core Operational", "mode": "Production"}
+    return {"status": "Pulse Prognosis Operational"}
