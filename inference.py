@@ -1,29 +1,28 @@
 import os
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.signal import find_peaks, resample
 from model import CNN_LSTM_Attn
 
 # --- Configuration ---
 FS = 360
 SAMPLE_LEN = 256
-THRESHOLD = 0.6
+THRESHOLD = 0.6  # If abnormal prob > 0.6, label is ABNORMAL
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Robust Path Logic ---
-# Locates ecg_model.pt in the same directory as this script
+# --- Path Logic ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "ecg_model.pt")
 
-# --- Singleton Model Initialization ---
-# We initialize the model structure outside the function so it loads only once
+# Initialize model structure
 model = CNN_LSTM_Attn().to(DEVICE)
 
 def initialize_model():
-    """Loads weights into the model if the file exists."""
+    """Loads weights into the model singleton."""
     if os.path.exists(MODEL_PATH):
         try:
-            # use weights_only=True for security if using newer torch versions
+            # map_location ensures it loads on CPU if CUDA is unavailable
             model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
             model.eval()
             print(f"✅ Neural Core Loaded Successfully: {MODEL_PATH}")
@@ -35,12 +34,12 @@ def initialize_model():
         print(f"❌ Critical Error: {MODEL_PATH} not found.")
         return False
 
-# Attempt to load on startup
+# Global flag for model status
 MODEL_LOADED = initialize_model()
 
 def predict_ecg(ecg_signal: np.ndarray):
     """
-    Processes raw ECG signal, extracts beats, and returns AI prediction.
+    Processes raw ECG signal, extracts beats, and calculates specific percentages.
     """
     # 1. Verification
     if not MODEL_LOADED:
@@ -49,8 +48,7 @@ def predict_ecg(ecg_signal: np.ndarray):
     if len(ecg_signal) < SAMPLE_LEN:
         return {"error": "Signal length too short for analysis."}
 
-    # 2. Normalization (Zero mean, unit variance)
-    # Added 1e-8 to prevent division by zero on flat signals
+    # 2. Normalization
     std = np.std(ecg_signal)
     if std < 1e-4:
         return {"error": "Invalid ECG signal: Flat line or zero variance detected."}
@@ -58,7 +56,6 @@ def predict_ecg(ecg_signal: np.ndarray):
     ecg = (ecg_signal - np.mean(ecg_signal)) / (std + 1e-8)
 
     # 3. R-peak Detection
-    # FS * 0.25 assumes a max heart rate of approx 240bpm
     peaks, _ = find_peaks(
         ecg,
         distance=int(0.25 * FS),
@@ -75,15 +72,12 @@ def predict_ecg(ecg_signal: np.ndarray):
         p = peaks[i]
         half = SAMPLE_LEN // 2
         
-        # Ensure the segment stays within array bounds
         if p - half < 0 or p + half >= len(ecg):
             continue
 
-        # Extract and Resample beat
         beat_segment = ecg[p - half : p + half]
         beat_resampled = resample(beat_segment, SAMPLE_LEN)
 
-        # Calculate Log-RR Interval (Temporal feature)
         rr_interval = (peaks[i] - peaks[i-1]) / FS
         rr_log = np.log1p(rr_interval)
 
@@ -94,22 +88,29 @@ def predict_ecg(ecg_signal: np.ndarray):
         return {"error": "Segmentation failed: No valid beats could be isolated."}
 
     # 5. Tensor Conversion
-    # X shape: [Batch, Channel, Length] | RR shape: [Batch, 1]
     X = torch.tensor(np.array(beats), dtype=torch.float32).unsqueeze(1).to(DEVICE)
     RR = torch.tensor(np.array(rrs), dtype=torch.float32).unsqueeze(1).to(DEVICE)
 
     # 6. Inference
     with torch.no_grad():
         logits = model(X, RR)
-        # Apply sigmoid to get probabilities (0.0 to 1.0)
-        probs = torch.sigmoid(logits).cpu().numpy()
+        # We use sigmoid for binary classification probability
+        abnormal_probs = torch.sigmoid(logits).cpu().numpy()
 
-    # 7. Aggregation
-    avg_prob = float(np.mean(probs))
-    prediction_label = "ABNORMAL" if avg_prob > THRESHOLD else "NORMAL"
+    # 7. Aggregation & Percentage Calculation
+    # Calculate the average probability of being "Abnormal" across all beats
+    avg_abnormal_prob = float(np.mean(abnormal_probs))
+    
+    # In binary classification: Normal Prob = 100% - Abnormal Prob
+    avg_normal_prob = 1.0 - avg_abnormal_prob
+
+    # Determine final label based on threshold
+    prediction_label = "ABNORMAL" if avg_abnormal_prob > THRESHOLD else "NORMAL"
 
     return {
-        "average_probability": round(avg_prob, 4),
         "prediction": prediction_label,
-        "num_beats": len(beats)
+        "average_probability": round(avg_abnormal_prob if avg_abnormal_prob > THRESHOLD else avg_normal_prob, 4),
+        "normal_percentage": round(avg_normal_prob * 100, 2),
+        "abnormal_percentage": round(avg_abnormal_prob * 100, 2),
+        "num_beats_analyzed": len(beats)
     }
