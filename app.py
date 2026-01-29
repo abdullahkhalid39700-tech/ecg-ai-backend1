@@ -12,7 +12,7 @@ from sqlalchemy.pool import NullPool
 from bcrypt import hashpw, gensalt, checkpw
 from supabase import create_client, Client
 
-# Import the inference logic from your inference.py
+# Import the inference logic
 from inference import predict_ecg
 
 app = FastAPI(title="Pulse Prognosis Neural Core API")
@@ -21,18 +21,29 @@ app = FastAPI(title="Pulse Prognosis Neural Core API")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SECRET_KEY = os.environ.get("SECRET_KEY", "pulse_prognosis_secure_key_2026")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+# Updated to match your Render Environment Key name
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY") 
 
-# Initialize Supabase Client
+# Global variable initialized to None to prevent 'name not defined' errors
+supabase: Client = None
+
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("❌ ERROR: Supabase credentials missing from environment variables.")
 else:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase Client Initialized")
+    except Exception as e:
+        print(f"❌ Supabase Initialization Failed: {e}")
 
 BUCKET_ID = "ecg-storage"
 
 def ensure_storage_exists():
     """Verifies or creates the Supabase storage bucket on startup."""
+    if supabase is None:
+        print("⚠️ Storage Setup Warning: Supabase client is not initialized.")
+        return
+        
     try:
         buckets = supabase.storage.list_buckets()
         if not any(b.id == BUCKET_ID for b in buckets):
@@ -43,10 +54,10 @@ def ensure_storage_exists():
     except Exception as e:
         print(f"⚠️ Storage Setup Warning: {e}")
 
+# Run storage check on startup
 ensure_storage_exists()
 
 # ===================== DATABASE SETUP =====================
-# NullPool is required when using Supabase connection pooling (port 6543)
 engine = create_engine(
     DATABASE_URL, 
     poolclass=NullPool, 
@@ -78,7 +89,7 @@ class ECGFile(Base):
     __tablename__ = "ecg_files"
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String)
-    file_path = Column(String)  # Stores the Supabase Public URL
+    file_path = Column(String)
     uploaded_at = Column(DateTime, default=datetime.datetime.utcnow)
     patient_id = Column(Integer, ForeignKey("patients.id"))
     user_id = Column(Integer, ForeignKey("users.id"))
@@ -107,7 +118,6 @@ def get_current_user(authorization: str = Header(None)):
     if not authorization:
         raise HTTPException(status_code=401, detail="Session expired. Please Login.")
     try:
-        # Expected format: "Bearer <token>" or simply "<token>"
         token = authorization.split(" ")[1] if " " in authorization else authorization
         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
         return payload.get("sub")
@@ -154,26 +164,29 @@ async def upload_ecg(
     patient_name: str = Form(...), age: int = Form(...), gender: str = Form(...),
     file: UploadFile = File(...), db: Session = Depends(get_db), email: str = Depends(get_current_user)
 ):
+    if supabase is None:
+        raise HTTPException(status_code=503, detail="Cloud storage service unavailable")
+
     user = db.query(User).filter(User.email == email).first()
     
-    # 1. Cloud Upload to Supabase
     try:
         file_content = await file.read()
         storage_path = f"{user.id}/{int(datetime.datetime.utcnow().timestamp())}_{file.filename}"
         
+        # Upload to Supabase Storage
         supabase.storage.from_(BUCKET_ID).upload(storage_path, file_content)
         file_url = supabase.storage.from_(BUCKET_ID).get_public_url(storage_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cloud Storage Error: {str(e)}")
 
-    # 2. Patient Logic
+    # Patient Logic
     patient = db.query(Patient).filter(Patient.name == patient_name, Patient.user_id == user.id).first()
     if not patient:
         patient = Patient(name=patient_name, age=age, gender=gender, user_id=user.id)
         db.add(patient)
         db.commit()
 
-    # 3. Database Entry
+    # Database Entry
     ecg_entry = ECGFile(
         filename=file.filename, 
         file_path=file_url, 
@@ -194,20 +207,15 @@ def predict_from_file(file_id: int, db: Session = Depends(get_db), email: str = 
         raise HTTPException(status_code=404, detail="Medical record not found")
 
     try:
-        # Pandas reads directly from the Supabase public URL
         df = pd.read_csv(ecg_file.file_path)
-        
-        # Check for numeric data; use column 1 (standard) or 0
         col = 1 if df.shape[1] > 1 else 0
         ecg = df.iloc[:, col].values.astype(float)
         
-        # Call the inference function
         prediction = predict_ecg(ecg)
         
         if "error" in prediction:
             raise HTTPException(status_code=400, detail=prediction["error"])
 
-        # Record analysis in History
         history = History(
             filename=ecg_file.filename, 
             result=prediction["prediction"], 
@@ -219,7 +227,7 @@ def predict_from_file(file_id: int, db: Session = Depends(get_db), email: str = 
 
         return {
             **prediction, 
-            "waveform": ecg.tolist()[:1000] # Return partial waveform for frontend chart
+            "waveform": ecg.tolist()[:1000]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis Engine Error: {str(e)}")
@@ -228,7 +236,8 @@ def predict_from_file(file_id: int, db: Session = Depends(get_db), email: str = 
 def list_files(db: Session = Depends(get_db), email: str = Depends(get_current_user)):
     user = db.query(User).filter(User.email == email).first()
     files = db.query(ECGFile).filter(ECGFile.user_id == user.id).all()
-    return files
+    # Map SQLAlchemy objects to dictionaries for clean JSON response
+    return [{"file_id": f.id, "filename": f.filename, "uploaded_at": f.uploaded_at, "patient_name": f.patient.name} for f in files]
 
 @app.get("/history")
 def get_history(db: Session = Depends(get_db), email: str = Depends(get_current_user)):
