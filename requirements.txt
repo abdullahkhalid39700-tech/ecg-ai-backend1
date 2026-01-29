@@ -10,5 +10,5 @@ sqlalchemy
 psycopg2-binary
 bcrypt
 pyjwt
-supabase
+supabase==2.4.0
 requests
