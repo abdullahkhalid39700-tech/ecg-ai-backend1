@@ -15,27 +15,27 @@ from inference import predict_ecg
 
 app = FastAPI(title="HeartAI Neural Core API")
 
-# --- DATABASE SETUP ---
+# ===================== DATABASE SETUP =====================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SECRET_KEY = os.environ.get("SECRET_KEY", "your_fallback_secret")
 
 engine = create_engine(
-    DATABASE_URL, 
+    DATABASE_URL,
     poolclass=NullPool,
     connect_args={"sslmode": "require"}
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELS ---
+# ===================== DATABASE MODELS =====================
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     password = Column(String, nullable=False)
-    history = relationship("History", back_populates="owner")
     patients = relationship("Patient", back_populates="owner")
     ecg_files = relationship("ECGFile", back_populates="owner")
+    history = relationship("History", back_populates="owner")
 
 class Patient(Base):
     __tablename__ = "patients"
@@ -70,7 +70,7 @@ class History(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- DEPENDENCIES ---
+# ===================== DEPENDENCIES =====================
 def get_db():
     db = SessionLocal()
     try:
@@ -87,16 +87,16 @@ def get_current_user(authorization: str = Header(None)):
     except:
         raise HTTPException(status_code=401, detail="Invalid Session")
 
-# --- CORS ---
+# ===================== CORS =====================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Update to your frontend URL in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- AUTH ROUTES ---
+# ===================== AUTH ROUTES =====================
 @app.post("/signup")
 def signup(data: dict, db: Session = Depends(get_db)):
     hashed = hashpw(data['password'].encode('utf-8'), gensalt()).decode('utf-8')
@@ -121,7 +121,7 @@ def login(data: dict, db: Session = Depends(get_db)):
     
     return {"token": token}
 
-# --- UPLOAD ROUTE FOR DEVICE / WEB ---
+# ===================== UPLOAD ECG =====================
 @app.post("/upload-ecg")
 async def upload_ecg(
     patient_name: str = Form(...),
@@ -143,7 +143,7 @@ async def upload_ecg(
         db.add(patient)
         db.commit()
 
-    # Save file
+    # Save file locally
     os.makedirs("storage", exist_ok=True)
     timestamp = datetime.datetime.utcnow().timestamp()
     file_location = f"storage/{timestamp}_{file.filename}"
@@ -162,7 +162,7 @@ async def upload_ecg(
 
     return {"message": "ECG stored successfully", "file_path": file_location}
 
-# --- LIST ECG FILES FOR SIDEBAR ---
+# ===================== LIST ECG FILES =====================
 @app.get("/ecg-files")
 def list_files(db: Session = Depends(get_db), email: str = Depends(get_current_user)):
     user = db.query(User).filter(User.email == email).first()
@@ -177,7 +177,7 @@ def list_files(db: Session = Depends(get_db), email: str = Depends(get_current_u
         for f in files
     ]
 
-# --- PREDICTION ON SELECTED FILE ---
+# ===================== PREDICT FROM FILE =====================
 @app.post("/predict-from-file/{file_id}")
 def predict_from_file(file_id: int, db: Session = Depends(get_db), email: str = Depends(get_current_user)):
     user = db.query(User).filter(User.email == email).first()
@@ -188,24 +188,29 @@ def predict_from_file(file_id: int, db: Session = Depends(get_db), email: str = 
     if not ecg_file:
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Read ECG CSV
     df = pd.read_csv(ecg_file.file_path)
     ecg = df.iloc[:, 1].values.astype(float)
     prediction = predict_ecg(ecg)
 
-    # Save to History
+    # Save to history
     diag_entry = History(
         filename=ecg_file.filename,
         result=prediction["prediction"],
-        probability=float(prediction["average_probability"]),
+        probability=float(prediction.get("average_probability", prediction.get("probability", 0))),
         user_id=user.id
     )
     db.add(diag_entry)
     db.commit()
 
-    prediction["waveform"] = ecg.tolist()[:1000]
-    return prediction
+    # Return for frontend
+    return {
+        "prediction": prediction["prediction"],
+        "probability": float(prediction.get("average_probability", prediction.get("probability", 0))),
+        "waveform": ecg.tolist()[:1000]
+    }
 
-# --- HISTORY ROUTE ---
+# ===================== HISTORY =====================
 @app.get("/history")
 def get_history(db: Session = Depends(get_db), email: str = Depends(get_current_user)):
     user = db.query(User).filter(User.email == email).first()
